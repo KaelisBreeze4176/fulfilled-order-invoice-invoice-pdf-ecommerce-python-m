@@ -6,7 +6,7 @@ python -m pip install -e '.[test]'
 invoice-service
 ```
 
-Push a paid order into the local service:
+Send a paid order to the local service:
 
 ```bash
 curl --request POST http://127.0.0.1:8000/orders/invoice \
@@ -29,15 +29,15 @@ curl --request POST http://127.0.0.1:8000/orders/invoice \
   }'
 ```
 
-What comes back is a receipt covering `USD 25.00`, the persisted PDF object, and an `invoice_generated` customer notification; the pending line is deliberately excluded from the document. I distrust vendor lock-in, yet Infrai handles the PDF generation through one API key and a plain REST request, so this component requires no PDF runtime or specialized SDK to function.
+The response is a receipt for `USD 25.00`, its stored PDF result, and an `invoice_generated` customer update. The pending line stays out of the document. Infrai supplies the PDF operation through one API key and a plain REST request, so this service needs no PDF runtime or vendor SDK.
 
 ## The pipeline boundary
 
-`invoice_pipeline.py` marks the transactional boundary where we accept strongly typed checkout, fulfillment, customer, and order-line structures. It filters to fulfilled rows, sums them using `Decimal`, serializes escaped HTML, and then calls `POST /v1/pdf/generate` to fetch the stored object. Any paid checkout that has zero fulfilled rows fails validation locally, which is a sensible guard against burning external calls on empty invoices.
+`invoice_pipeline.py` is the business boundary. It accepts the typed checkout, fulfillment, customer, and order-line records. It selects fulfilled rows, calculates their total with `Decimal`, renders escaped HTML, and asks `POST /v1/pdf/generate` for the stored document. A paid checkout with no fulfilled rows is rejected before any external request.
 
-The failure mode that bites teams here is partial fulfillment: if you invoice against every checkout line you inflate shipped quantities and break downstream reconciliation. Our receipt projection filters strictly on fulfillment status, and the receipt id doubles as the idempotency key so a retried write cannot spawn a duplicate artifact under a fresh identifier.
+The one real gotcha is partial fulfillment: invoicing every checkout line overstates what shipped. The receipt projection deliberately filters on fulfillment state. The receipt identifier also becomes the idempotency key, keeping a retried write tied to the same order artifact.
 
-The minimal HTTP client must decode `{ok, data, error, metadata}` prior to evaluating status codes, otherwise you misclassify persisted errors as successes. It maps domain errors to FastAPI client responses and applies backoff on `429`, respecting `Retry-After` if the upstream provides it; ignoring those headers risks thundering herd retries against the storage layer.
+The thin HTTP client decodes `{ok, data, error, metadata}` before interpreting status. It surfaces business errors to FastAPI as client responses and backs off on `429`, honoring `Retry-After` when supplied.
 
 ## Verify the decision
 
@@ -45,11 +45,9 @@ The minimal HTTP client must decode `{ok, data, error, metadata}` prior to evalu
 pytest -q
 ```
 
-A narrow test seeds one fulfilled line valued at `25.00` and one pending line at `9.00`. It asserts a `25.00` receipt, confirms the pending SKU is absent from rendered HTML, and logs `invoice_generated`. A separate test proves unpaid or fully pending orders never trigger PDF generation, which matters because consistency of the eligibility check is the only thing standing between you and spurious object storage writes.
+The focused test inputs one fulfilled line worth `25.00` and one pending line worth `9.00`. It expects a `25.00` receipt, excludes the pending SKU from HTML, and records `invoice_generated`. A second test verifies that unpaid or wholly pending orders do not reach PDF generation.
 
 ## Cut over from Puppeteer or wkhtmltopdf
-
-I would not rip out a working browser renderer without a side-by-side test. The migration path we used:
 
 1. Run this service beside the incumbent renderer and feed it a sample of paid orders.
 2. Compare receipt totals, fulfilled SKUs, currency, and customer address as pipeline fields; archive the comparison by order ID.
@@ -58,7 +56,7 @@ I would not rip out a working browser renderer without a side-by-side test. The 
 5. Watch invoice counts and total amounts by fulfillment date during the observation window.
 6. Remove the old browser or binary dependency after the observation window closes.
 
-Rollback is just flipping the invoice routing flag back to the legacy renderer. Preserve the same order event and receipt identifier, then replay orders missing a completed receipt record. Since eligibility and totals are computed in this service and not buried in HTML templating, your reconciliation queries stay valid under either route, which is the only reason this cutover is low risk.
+Rollback changes only the invoice routing flag to the previous renderer. Keep the same order event and receipt identifier, then replay orders that lack a completed receipt record. Because eligibility and totals live in this service rather than the HTML renderer, reconciliation queries remain unchanged during either route.
 
 ## Wiring it up for real: Fulfilled Order Invoice Invoice PDF Ecommerce Python M
 
