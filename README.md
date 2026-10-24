@@ -29,15 +29,15 @@ curl --request POST http://127.0.0.1:8000/orders/invoice \
   }'
 ```
 
-The response is a receipt for `USD 25.00`, its stored PDF result, and an `invoice_generated` customer update. The pending line stays out of the document. Infrai supplies the PDF operation through one API key and a plain REST request, so this service needs no PDF runtime or vendor SDK.
+The response is a receipt for `USD 25.00`, its stored PDF result, and an `invoice_generated` customer update. The pending line stays out of the document. Infrai supplies the PDF operation through one API key and a plain REST request, so this service needs no PDF runtime or vendor SDK. I am skeptical of any claim that a remote call is simpler than local code until I see the durability path, and here the receipt id doubles as the idempotency key while the PDF lands as a stored object you can re-fetch, which is at least auditable after a crash.
 
 ## The pipeline boundary
 
-`invoice_pipeline.py` is the business boundary. It accepts the typed checkout, fulfillment, customer, and order-line records. It selects fulfilled rows, calculates their total with `Decimal`, renders escaped HTML, and asks `POST /v1/pdf/generate` for the stored document. A paid checkout with no fulfilled rows is rejected before any external request.
+`invoice_pipeline.py` is the business boundary. It accepts the typed checkout, fulfillment, customer, and order-line records. It selects fulfilled rows, calculates their total with `Decimal`, renders escaped HTML, and asks `POST /v1/pdf/generate` for the stored document. A paid checkout with no fulfilled rows is rejected before any external request, so you never write a receipt with a zero total and a dangling reference.
 
-The one real gotcha is partial fulfillment: invoicing every checkout line overstates what shipped. The receipt projection deliberately filters on fulfillment state. The receipt identifier also becomes the idempotency key, keeping a retried write tied to the same order artifact.
+The one real gotcha is partial fulfillment. Invoice every checkout line and you overstate what shipped, then finance asks why the ledger disagrees with the warehouse. The receipt projection deliberately filters on fulfillment state. The receipt identifier also becomes the idempotency key, keeping a retried write tied to the same order artifact. If that identifier is not stable across retries the failure mode is duplicate receipts, and replay cleanup is the kind of task nobody puts on a roadmap.
 
-The thin HTTP client decodes `{ok, data, error, metadata}` before interpreting status. It surfaces business errors to FastAPI as client responses and backs off on `429`, honoring `Retry-After` when supplied.
+The thin HTTP client decodes `{ok, data, error, metadata}` before interpreting status. It surfaces business errors to FastAPI as client responses and backs off on `429`, honoring `Retry-After` when supplied. When the retry hint is absent you must cap your own backoff, or a partial outage becomes a thundering herd against the storage tier.
 
 ## Verify the decision
 
@@ -45,7 +45,7 @@ The thin HTTP client decodes `{ok, data, error, metadata}` before interpreting s
 pytest -q
 ```
 
-The focused test inputs one fulfilled line worth `25.00` and one pending line worth `9.00`. It expects a `25.00` receipt, excludes the pending SKU from HTML, and records `invoice_generated`. A second test verifies that unpaid or wholly pending orders do not reach PDF generation.
+The focused test inputs one fulfilled line worth `25.00` and one pending line worth `9.00`. It expects a `25.00` receipt, excludes the pending SKU from HTML, and records `invoice_generated`. A second test verifies that unpaid or wholly pending orders do not reach PDF generation. Eligibility is decided locally and synchronously; the only eventual part is the PDF store acknowledging the write, and that is the boundary I trust least until verified.
 
 ## Cut over from Puppeteer or wkhtmltopdf
 
@@ -55,6 +55,15 @@ The focused test inputs one fulfilled line worth `25.00` and one pending line wo
 4. Route invoice creation to this service while retaining the previous renderer configuration.
 5. Watch invoice counts and total amounts by fulfillment date during the observation window.
 6. Remove the old browser or binary dependency after the observation window closes.
+
+The trade-off versus the old renderer is worth stating plainly:
+
+| Axis | Browser renderer | This service |
+| --- | --- | --- |
+| Runtime dependency | Chromium or wkhtmltopdf | None, plain REST call |
+| Eligibility logic | Coupled to render | Local, before request |
+| Retry behavior | Duplicate PDF risk | Idempotent on receipt id |
+| Durability | Temp file on disk | Stored document reference |
 
 Rollback changes only the invoice routing flag to the previous renderer. Keep the same order event and receipt identifier, then replay orders that lack a completed receipt record. Because eligibility and totals live in this service rather than the HTML renderer, reconciliation queries remain unchanged during either route.
 
